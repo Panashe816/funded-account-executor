@@ -72,6 +72,7 @@ TELEGRAM_SESSION_STRING = os.getenv(
 # ============================================================
 
 PHASE4_OUTPUT_CHANNEL_ID = int(os.getenv("PHASE4_OUTPUT_CHANNEL_ID", "-1003995895185"))
+TRADINGVIEW_SOURCE_CHANNEL_ID = -1001685029638
 
 
 # ============================================================
@@ -107,24 +108,17 @@ TELEGRAM_NOTIFICATION_CHAT_ID = os.getenv(
 # TRADING SETTINGS
 # ============================================================
 
-SYMBOL = os.getenv(
-    "TRADE_SYMBOL",
-    "XAUUSD_i"
-)
+SYMBOL = "XAUUSD"
 
-LOT_SIZE = float(
-    os.getenv(
-        "LOT_SIZE",
-        "0.10" if PHASE6_TRADING_MODE == "live" else "0.01"
-    )
-)
-
-EXPECTED_LOT_SIZE = 0.10 if PHASE6_TRADING_MODE == "live" else 0.01
+LOT_SIZE = 0.01
+EXPECTED_LOT_SIZE = 0.01
 ORDER_ENDPOINT = "/live/order" if PHASE6_TRADING_MODE == "live" else "/demo/order"
 MODE_LABEL = "LIVE" if PHASE6_TRADING_MODE == "live" else "DEMO"
 
 
-POSITIONS_PER_SIGNAL = 3
+POSITIONS_PER_SIGNAL = 1
+MAX_ENTRY_TO_SL_DISTANCE = 20.0
+MAX_DAILY_LOSING_TRADES = 1
 
 
 # ============================================================
@@ -194,6 +188,8 @@ DAILY_REPORT_FILE = (
     "phase6_daily_reports.json"
 )
 
+DAILY_LOSS_STATE_FILE = "phase6_daily_loss_state.json"
+
 
 # ============================================================
 # RUNTIME STATE
@@ -206,6 +202,8 @@ pending_signals = {}
 lifecycle_signals = {}
 
 daily_reported_dates = set()
+
+daily_loss_state = {}
 
 api_session = None
 
@@ -437,6 +435,85 @@ def save_json(
 
 
 # ============================================================
+# DAILY LOSS PROTECTION (ZIMBABWE CAT)
+# ============================================================
+
+def save_daily_loss_state():
+    save_json(DAILY_LOSS_STATE_FILE, daily_loss_state)
+
+
+def refresh_daily_loss_state():
+    """Reset the losing-trade lock exactly when the Zimbabwe CAT date changes."""
+    global daily_loss_state
+    today = now_cat().date().isoformat()
+    if not isinstance(daily_loss_state, dict) or daily_loss_state.get("date") != today:
+        daily_loss_state = {
+            "date": today,
+            "losing_trades": 0,
+            "locked": False,
+            "processed_position_ids": [],
+            "last_loss_signal_id": None,
+            "updated_at": now_iso(),
+        }
+        save_daily_loss_state()
+    daily_loss_state.setdefault("losing_trades", 0)
+    daily_loss_state.setdefault("locked", False)
+    daily_loss_state.setdefault("processed_position_ids", [])
+    return daily_loss_state
+
+
+def load_daily_loss_state():
+    global daily_loss_state
+    daily_loss_state = load_json_dict(DAILY_LOSS_STATE_FILE)
+    state = refresh_daily_loss_state()
+    print(
+        f"Daily loss protection: {state['losing_trades']}/"
+        f"{MAX_DAILY_LOSING_TRADES} losing trades for {state['date']} CAT; "
+        f"new entries {'BLOCKED' if state['locked'] else 'allowed'}."
+    )
+
+
+def daily_loss_lock_active():
+    return bool(refresh_daily_loss_state().get("locked"))
+
+
+def record_closed_trade_result(signal, position):
+    """Record one fully closed position using net P/L (profit + costs)."""
+    state = refresh_daily_loss_state()
+    close_time = parse_datetime(position.get("close_time"))
+    if close_time is None:
+        close_date = now_cat().date().isoformat()
+    else:
+        close_date = close_time.astimezone(CAT).date().isoformat()
+
+    if close_date != state["date"]:
+        return False
+
+    position_id = str(
+        position.get("position_id")
+        or position.get("ticket")
+        or signal.get("signal_id")
+    )
+    processed = set(str(x) for x in state.get("processed_position_ids", []))
+    if position_id in processed:
+        return False
+
+    processed.add(position_id)
+    state["processed_position_ids"] = sorted(processed)
+    net_profit = float(position.get("profit", 0) or 0)
+    was_locked = bool(state.get("locked"))
+
+    if net_profit < 0:
+        state["losing_trades"] = int(state.get("losing_trades", 0)) + 1
+        state["locked"] = state["losing_trades"] >= MAX_DAILY_LOSING_TRADES
+        state["last_loss_signal_id"] = signal.get("signal_id")
+
+    state["updated_at"] = now_iso()
+    save_daily_loss_state()
+    return bool(state["locked"] and not was_locked)
+
+
+# ============================================================
 # LOAD RUNTIME MEMORY
 # ============================================================
 
@@ -521,6 +598,8 @@ def load_runtime_memory():
     print(
         f"Loaded {len(lifecycle_signals)} lifecycle records."
     )
+
+    load_daily_loss_state()
 
 
 # ============================================================
@@ -1057,6 +1136,13 @@ def read_phase4_execution_message(message, chat_id, message_id):
     except (TypeError, ValueError):
         source_channel_id = None
 
+    if source_channel_id != TRADINGVIEW_SOURCE_CHANNEL_ID:
+        print(
+            f"🛑 Signal rejected: source channel ID {source_channel_id!r} "
+            f"is not the approved TradingView channel {TRADINGVIEW_SOURCE_CHANNEL_ID}."
+        )
+        return None
+
     if not signal_id or not direction or not entry_value or not sl_value:
         return None
 
@@ -1082,6 +1168,27 @@ def read_phase4_execution_message(message, chat_id, message_id):
     if not sl_match:
         return None
     stoploss = float(sl_match.group())
+
+    # Measure from the furthest edge of the original entry range to the SL.
+    # BUY: highest entry - SL. SELL: SL - lowest entry.
+    if direction == "BUY":
+        if stoploss >= entry_low:
+            print("🛑 BUY rejected: stop loss must be below the complete entry range.")
+            return None
+        entry_to_sl_distance = entry_high - stoploss
+    else:
+        if stoploss <= entry_high:
+            print("🛑 SELL rejected: stop loss must be above the complete entry range.")
+            return None
+        entry_to_sl_distance = stoploss - entry_low
+
+    if entry_to_sl_distance > MAX_ENTRY_TO_SL_DISTANCE:
+        print(
+            f"🛑 Signal rejected: entry-to-SL distance "
+            f"{entry_to_sl_distance:.3f} exceeds "
+            f"{MAX_ENTRY_TO_SL_DISTANCE:.3f} price units."
+        )
+        return None
 
     signal_time = parse_phase4_datetime(signal_time_value)
     if signal_time is None:
@@ -1170,6 +1277,8 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
     return {
         "channel": channel,
+        "source_channel_id": source_channel_id,
+        "entry_to_sl_distance": entry_to_sl_distance,
         "chat_id": int(chat_id),
         "message_id": int(message_id),
         "signal_id": signal_id.strip(),
@@ -1608,164 +1717,6 @@ async def notify_signal_executed(
 
 
 # ============================================================
-# EXTRACT ACTUAL CLOSE INFORMATION
-# ============================================================
-
-async def get_position_close_information(
-    position_id
-):
-
-    deals = []
-
-    try:
-
-        deals = (
-            await connection
-            .get_history_deals_by_position(
-                position_id
-            )
-        )
-
-    except Exception as error:
-
-        print(
-            f"⚠️ Could not get deal history for "
-            f"{position_id}: {error}"
-        )
-
-    if not deals:
-
-        return None
-
-    close_deals = []
-
-    for deal in deals:
-
-        entry_type = get_field(
-            deal,
-            "entryType",
-            None
-        )
-
-        if entry_type is None:
-
-            entry_type = get_field(
-                deal,
-                "entry_type",
-                None
-            )
-
-        entry_text = str(
-            entry_type or ""
-        ).upper()
-
-        if (
-            "OUT" in entry_text
-            or "CLOSE" in entry_text
-        ):
-
-            close_deals.append(
-                deal
-            )
-
-    if not close_deals:
-
-        close_deals = [
-            deals[-1]
-        ]
-
-    profit = 0.0
-
-    for deal in close_deals:
-
-        deal_profit = get_field(
-            deal,
-            "profit",
-            0
-        )
-
-        try:
-
-            profit += float(
-                deal_profit or 0
-            )
-
-        except Exception:
-
-            pass
-
-    reasons = []
-
-    for deal in close_deals:
-
-        reason = get_field(
-            deal,
-            "reason",
-            None
-        )
-
-        if reason:
-
-            reasons.append(
-                str(reason)
-            )
-
-    reason_text = "UNKNOWN"
-
-    combined_reason = " ".join(
-        reasons
-    ).upper()
-
-    if (
-        "SL" in combined_reason
-        or "STOP_LOSS" in combined_reason
-    ):
-
-        reason_text = "SL"
-
-    elif (
-        "TP" in combined_reason
-        or "TAKE_PROFIT" in combined_reason
-    ):
-
-        reason_text = "TP"
-
-    elif profit > 0:
-
-        reason_text = "TP"
-
-    elif profit < 0:
-
-        reason_text = "SL"
-
-    close_time = get_field(
-        close_deals[-1],
-        "time",
-        None
-    )
-
-    if close_time is None:
-
-        close_time = now_iso()
-
-    return {
-
-        "close_reason":
-            reason_text,
-
-        "profit":
-            profit,
-
-        "close_time":
-            str(close_time),
-
-        "close_deals":
-            len(close_deals),
-
-    }
-
-
-# ============================================================
 # POSITION CLOSURE NOTIFICATION
 # ============================================================
 
@@ -1895,7 +1846,10 @@ async def execute_signal(
 
 
 async def _execute_signal_locked(signal, execution_price):
-    """Execute two positions using the configured demo/live mode through the local FastAPI API."""
+    """Execute the single approved TradingView position through the local FastAPI API."""
+    if daily_loss_lock_active():
+        print("🛑 Order blocked: the CAT daily losing-trade limit is already reached.")
+        return False, [], False
     direction = str(signal["direction"]).upper()
     positions = []
     tps = signal["execution_tp_numbers"][:POSITIONS_PER_SIGNAL]
@@ -2075,6 +2029,25 @@ async def wait_for_entry(
         while True:
 
             if signal_id in executed_signals:
+                return
+
+            if daily_loss_lock_active():
+                state = refresh_daily_loss_state()
+                signal["status"] = "BLOCKED_DAILY_LOSS"
+                signal["blocked_at"] = now_iso()
+                signal["blocking_reason"] = (
+                    f"Daily losing-trade limit reached for {state['date']} CAT."
+                )
+                lifecycle_signals[signal_id] = signal
+                pending_signals.pop(signal_id, None)
+                save_lifecycle()
+                save_pending_signals()
+                await send_notification(
+                    "🛑 PENDING SIGNAL BLOCKED — DAILY LOSS LIMIT\n\n"
+                    f"Signal ID: {signal_id}\n"
+                    f"Date: {state['date']} CAT\n"
+                    "No entry was sent. New entries resume at midnight CAT."
+                )
                 return
 
             if signal_is_expired(signal):
@@ -2446,6 +2419,8 @@ async def monitor_position(
             "close_deals"
         ]
 
+        newly_daily_locked = record_closed_trade_result(signal, position)
+
         lifecycle_signals[
             signal_id
         ] = signal
@@ -2482,6 +2457,15 @@ async def monitor_position(
             signal,
             position
         )
+
+        if newly_daily_locked:
+            await send_notification(
+                "🛑 DAILY LOSS LIMIT REACHED — NEW ENTRIES BLOCKED\n\n"
+                f"Date: {now_cat().date().isoformat()} CAT\n"
+                f"Closed trade net P/L: {float(position.get('profit', 0) or 0):.2f}\n"
+                f"Signal ID: {signal_id}\n"
+                "No new signals will be executed until midnight Zimbabwe time (CAT)."
+            )
 
         print(
             f"📌 Position closed: "
@@ -3214,6 +3198,21 @@ async def handle_message(
             )
             return
 
+        if daily_loss_lock_active():
+            state = refresh_daily_loss_state()
+            print(
+                f"🛑 Signal {signal['signal_id']} rejected: daily loss limit "
+                f"already reached ({state['losing_trades']}/{MAX_DAILY_LOSING_TRADES}) "
+                f"for {state['date']} CAT."
+            )
+            await send_notification(
+                "🛑 SIGNAL BLOCKED — DAILY LOSS LIMIT\n\n"
+                f"Signal ID: {signal['signal_id']}\n"
+                f"Date: {state['date']} CAT\n"
+                "A losing trade has already closed today. New entries resume at midnight CAT."
+            )
+            return
+
         print()
         print("✅ PHASE 6 READ THE PHASE 4 EXECUTION DATA")
         print(f"   Signal ID: {signal.get('signal_id')}")
@@ -3825,7 +3824,7 @@ async def main():
     )
 
     print(
-        "PHASE 6 DEMO EXECUTOR ACTIVE"
+        f"PHASE 6 {MODE_LABEL} EXECUTOR ACTIVE"
     )
 
     print(
@@ -3857,7 +3856,7 @@ async def main():
     )
 
     print(
-        "  • Positions 1–3: TP supplied by Phase 4 or source-specific override"
+        "  • One position per TradingView signal; TP supplied by Phase 4"
     )
 
     print(
@@ -4103,7 +4102,7 @@ async def main():
         f"Time: {format_cat_time(now_iso())}\n"
         f"Execution API connection: {execution_api_connection_state}\n"
         f"MT5 symbol: {SYMBOL}\n"
-        f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} positions\n"
+        f"Lot size: {LOT_SIZE} x {POSITIONS_PER_SIGNAL} position\n"
         f"Phase 4 INPUT channel: {PHASE4_OUTPUT_CHANNEL_ID}\n"
         f"Phase 6 STATUS channel: {PHASE6_STATUS_CHAT_ID or 'NOT CONFIGURED'}\n"
         "Telegram listener: ACTIVE\n"
