@@ -1766,7 +1766,7 @@ async def notify_position_closed(
 
 
 # ============================================================
-# EXECUTE TWO POSITIONS
+# EXECUTE ONE POSITION
 # ============================================================
 
 def build_trade_identifiers(signal_id, position_number):
@@ -2587,7 +2587,7 @@ async def lifecycle_completion_watcher():
                         "\n"
                         f"Channel: {signal['channel']}\n"
                         f"Signal ID: {signal_id}\n"
-                        "Both positions have closed."
+                        "The position has closed."
                     )
 
             if changed:
@@ -3572,7 +3572,19 @@ def display_settings():
     )
 
     print(
-        "  • Position closure: TP / SL + actual P/L"
+        "  • Position closure: TP / SL + actual net P/L (including costs)"
+    )
+
+    print(
+        f"  • Approved signal source: TradingView only ({TRADINGVIEW_SOURCE_CHANNEL_ID})"
+    )
+
+    print(
+        f"  • Maximum entry-to-SL distance: {MAX_ENTRY_TO_SL_DISTANCE:.1f} price units"
+    )
+
+    print(
+        f"  • Daily losing-trade limit: {MAX_DAILY_LOSING_TRADES} (resets at midnight CAT)"
     )
 
     print(
