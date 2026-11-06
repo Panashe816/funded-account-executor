@@ -1200,8 +1200,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
 
     valid_until = signal_time + timedelta(hours=2)
 
-    # Read Phase 4 execution targets first, then apply the two approved
-    # source-specific overrides. Other sources keep Phase 4's supplied targets.
+    # Read the Phase 4 execution target for the approved TradingView source.
     execution_numbers = []
     execution_tps = {}
 
@@ -1235,9 +1234,7 @@ def read_phase4_execution_message(message, chat_id, message_id):
     # These IDs must match SOURCE_CHANNELS / TP_MAPPING in Phase 4.
     # Names are diagnostic only and are not used to select the source policy.
     source_tp_policy = {
-        -1001685029638: {"name": "Trading View", "tp": 8, "fallback": 7},
-        -1001303958625: {"name": "KING OF XAUUSD", "tp": 5, "fallback": None},
-        -1003170522699: {"name": "GUNS THE TRADER", "tp": 4, "fallback": None},
+        TRADINGVIEW_SOURCE_CHANNEL_ID: {"name": "Trading View", "tp": 8, "fallback": 7},
     }
     source_policy = source_tp_policy.get(source_channel_id)
 
