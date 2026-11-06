@@ -480,7 +480,27 @@ def daily_loss_lock_active():
 def record_closed_trade_result(signal, position):
     """Record one fully closed position using net P/L (profit + costs)."""
     state = refresh_daily_loss_state()
-    close_time = parse_datetime(position.get("close_time"))
+    raw_close_time = position.get("close_time")
+    close_time = None
+    if isinstance(raw_close_time, (int, float)):
+        timestamp = float(raw_close_time)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        try:
+            close_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            close_time = None
+    else:
+        close_time = parse_datetime(raw_close_time)
+        if close_time is None and raw_close_time:
+            try:
+                timestamp = float(str(raw_close_time).strip())
+                if timestamp > 1_000_000_000_000:
+                    timestamp /= 1000.0
+                close_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                close_time = None
+
     if close_time is None:
         close_date = now_cat().date().isoformat()
     else:
