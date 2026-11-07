@@ -108,7 +108,7 @@ TELEGRAM_NOTIFICATION_CHAT_ID = os.getenv(
 # TRADING SETTINGS
 # ============================================================
 
-SYMBOL = "XAUUSD"
+SYMBOL = "XAU/USD"
 
 LOT_SIZE = 0.01
 EXPECTED_LOT_SIZE = 0.01
@@ -188,7 +188,11 @@ DAILY_REPORT_FILE = (
     "phase6_daily_reports.json"
 )
 
-DAILY_LOSS_STATE_FILE = "phase6_daily_loss_state.json"
+# Render persistent disk should be mounted at /var/data.
+# Override DATA_DIR only when the Render disk uses another mount path.
+DATA_DIR = os.getenv("DATA_DIR", "/var/data").strip() or "/var/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+DAILY_LOSS_STATE_FILE = os.path.join(DATA_DIR, "phase6_daily_loss_state.json")
 
 
 # ============================================================
@@ -1416,13 +1420,15 @@ async def execution_api_connection_monitor():
 
 
 async def verify_symbol():
-    quote = await api_request("GET", f"/symbols/{SYMBOL}/quote")
+    quote = await api_request("GET", "/symbols/quote", params={"symbol": SYMBOL})
+    if quote.get("symbol") != SYMBOL:
+        raise RuntimeError(f"Symbol verification failed: requested {SYMBOL}, API returned {quote.get('symbol')!r}")
     print(f"✅ {SYMBOL} available through local MT5 API; digits={quote.get('digits')}; order volume selected by Phase 6 mode ({MODE_LABEL})")
     return quote
 
 
 async def get_current_price():
-    quote = await api_request("GET", f"/symbols/{SYMBOL}/quote")
+    quote = await api_request("GET", "/symbols/quote", params={"symbol": SYMBOL})
     if quote.get("bid") is None or quote.get("ask") is None:
         raise RuntimeError(f"Could not obtain local MT5 quote: {quote}")
     return float(quote["bid"]), float(quote["ask"])
